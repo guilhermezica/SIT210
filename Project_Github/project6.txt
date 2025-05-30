@@ -1,0 +1,489 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import ssl
+import time
+import sqlite3
+from datetime import datetime
+from collections import deque
+import threading
+import queue
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+try:
+    import paho.mqtt.client as mqtt
+    MQTT_AVAILABLE = True
+except ImportError:
+    MQTT_AVAILABLE = False
+    print("⚠️ MQTT library not available. Running in simulation mode.")
+
+# Configuration
+MQTT_BROKER = "9c8938d3b2404aa98dafd50aa5ddd1b1.s1.eu.hivemq.cloud"
+MQTT_PORT = 8883
+MQTT_TOPIC_FEEDBACK = "kitchen/feedback/response"
+MQTT_TOPIC_TEMP = "kitchen/temperature"
+MQTT_TOPIC_SENSOR_CONTROL = "kitchen/sensor/control"
+MQTT_TOPIC_SENSOR_STATUS = "kitchen/sensor/status"
+MQTT_USER = "BillZZ"  
+MQTT_PASS = "BillZZ92"
+
+class CookingMonitorApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Smart Cooking Monitor")
+        self.root.geometry("650x550")
+
+        # Variables
+        self.threshold = tk.DoubleVar(value=30.0)
+        self.cooking_time = tk.StringVar(value="0s")
+        self.last_feedback = tk.StringVar(value="None")
+        self.live_temp = tk.DoubleVar(value=20.0)
+        self.connection_status = tk.StringVar(value="Disconnected")
+        self.sensor_enabled = tk.BooleanVar(value=True)
+        self.sensor_status = tk.StringVar(value="Unknown")
+        self.last_temp_time = 0
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = 5
+
+        # Data tracking
+        self.temps = deque(maxlen=100)  # Increased buffer size
+        self.timestamps = deque(maxlen=100)
+        self.start_time = time.time()
+        self.above_threshold = False
+        self.cook_start_time = None
+        self.total_cook_duration = 0
+        self.active_threshold = self.threshold.get()
+
+        self.message_queue = queue.Queue()
+
+        # Setup
+        self.setup_ui()
+        self.setup_plot()
+        self.setup_database()
+
+        if MQTT_AVAILABLE and self.validate_mqtt_config():
+            self.setup_mqtt()
+        else:
+            self.start_simulation_mode()
+
+        self.update_graph()
+        self.process_messages()
+        self.monitor_sensor_activity()
+        self.monitor_connection()
+
+    def validate_mqtt_config(self):
+        if MQTT_USER == "your_username" or MQTT_PASS == "your_password":
+            return not messagebox.askyesno("MQTT", "Credentials missing. Use simulation mode?")
+        return True
+
+    def setup_ui(self):
+        # Main frame
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Status frame
+        status_frame = ttk.LabelFrame(main_frame, text="Connection Status", padding="5")
+        status_frame.grid(row=0, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
+
+        # Connection status
+        ttk.Label(status_frame, text="MQTT:").grid(row=0, column=0, sticky="e", padx=(0, 5))
+        self.connection_label = ttk.Label(status_frame, textvariable=self.connection_status, font=("Arial", 9, "bold"))
+        self.connection_label.grid(row=0, column=1, sticky="w")
+
+        # Arduino status
+        ttk.Label(status_frame, text="Arduino:").grid(row=0, column=2, sticky="e", padx=(20, 5))
+        self.arduino_status_label = ttk.Label(status_frame, textvariable=self.sensor_status, font=("Arial", 9, "bold"))
+        self.arduino_status_label.grid(row=0, column=3, sticky="w")
+
+        # Control frame
+        control_frame = ttk.LabelFrame(main_frame, text="Sensor Control", padding="5")
+        control_frame.grid(row=1, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
+
+        # Sensor control button
+        self.sensor_button = ttk.Button(control_frame, text="🔴 Put Sensor to Sleep", command=self.toggle_sensor, width=20)
+        self.sensor_button.grid(row=0, column=0, padx=5)
+        
+        # Sensor status indicator
+        ttk.Label(control_frame, text="Status:").grid(row=0, column=1, padx=(20, 5))
+        self.sensor_status_indicator = ttk.Label(control_frame, text="ACTIVE", foreground="green", font=("Arial", 10, "bold"))
+        self.sensor_status_indicator.grid(row=0, column=2)
+
+        # Reconnect button
+        self.reconnect_button = ttk.Button(control_frame, text="🔄 Reconnect", command=self.manual_reconnect)
+        self.reconnect_button.grid(row=0, column=3, padx=(20, 0))
+
+        # Settings frame
+        settings_frame = ttk.LabelFrame(main_frame, text="Temperature Settings", padding="5")
+        settings_frame.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
+
+        # Threshold setting
+        ttk.Label(settings_frame, text="Cooking Threshold (°C):").grid(row=0, column=0, sticky="e", padx=(0, 5))
+        threshold_entry = ttk.Entry(settings_frame, textvariable=self.threshold, width=8)
+        threshold_entry.grid(row=0, column=1, sticky="w")
+        ttk.Button(settings_frame, text="Apply", command=self.apply_threshold).grid(row=0, column=2, padx=(5, 0))
+
+        # Current temperature display
+        ttk.Label(settings_frame, text="Current Temp:").grid(row=0, column=3, sticky="e", padx=(20, 5))
+        self.temp_label = ttk.Label(settings_frame, textvariable=self.live_temp, font=("Arial", 14, "bold"), foreground="blue")
+        self.temp_label.grid(row=0, column=4, sticky="w")
+        ttk.Label(settings_frame, text="°C").grid(row=0, column=5, sticky="w")
+
+        # Cooking info frame
+        cooking_frame = ttk.LabelFrame(main_frame, text="Cooking Information", padding="5")
+        cooking_frame.grid(row=3, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
+
+        # Cooking time
+        ttk.Label(cooking_frame, text="Active Cooking Time:").grid(row=0, column=0, sticky="e", padx=(0, 5))
+        cooking_time_label = ttk.Label(cooking_frame, textvariable=self.cooking_time, font=("Arial", 12, "bold"), foreground="red")
+        cooking_time_label.grid(row=0, column=1, sticky="w")
+
+        # Last feedback
+        ttk.Label(cooking_frame, text="Last Feedback:").grid(row=0, column=2, sticky="e", padx=(20, 5))
+        feedback_label = ttk.Label(cooking_frame, textvariable=self.last_feedback, font=("Arial", 10))
+        feedback_label.grid(row=0, column=3, sticky="w")
+
+        # Feedback buttons frame
+        feedback_frame = ttk.LabelFrame(main_frame, text="Rate Your Cooking", padding="5")
+        feedback_frame.grid(row=4, column=0, columnspan=3, pady=(0, 10))
+
+        button_frame = ttk.Frame(feedback_frame)
+        button_frame.pack()
+        
+        ttk.Button(button_frame, text="😊 Excellent", command=lambda: self.record_feedback("excellent")).grid(row=0, column=0, padx=5)
+        ttk.Button(button_frame, text="🙂 Good", command=lambda: self.record_feedback("good")).grid(row=0, column=1, padx=5)
+        ttk.Button(button_frame, text="😐 Average", command=lambda: self.record_feedback("average")).grid(row=0, column=2, padx=5)
+        ttk.Button(button_frame, text="🙁 Poor", command=lambda: self.record_feedback("poor")).grid(row=0, column=3, padx=5)
+
+    def setup_plot(self):
+        # Create plot frame
+        plot_frame = ttk.LabelFrame(self.root, text="Temperature Graph", padding="5")
+        plot_frame.grid(row=1, column=0, padx=10, pady=10, sticky=(tk.W, tk.E, tk.N, tk.S))
+
+        self.fig, self.ax = plt.subplots(figsize=(9, 4))
+        self.line, = self.ax.plot([], [], 'b-', linewidth=2, label="Temperature", alpha=0.8)
+        self.threshold_line = self.ax.axhline(y=self.active_threshold, color='r', linestyle='--', linewidth=2, label="Cooking Threshold")
+
+        self.ax.set_xlim(0, 60)
+        self.ax.set_ylim(10, 60)
+        self.ax.set_xlabel("Time (seconds ago)", fontsize=10)
+        self.ax.set_ylabel("Temperature (°C)", fontsize=10)
+        self.ax.set_title("Live Temperature Monitoring", fontsize=12, fontweight='bold')
+        self.ax.legend(loc='upper left')
+        self.ax.grid(True, alpha=0.3)
+        
+        # Style the plot
+        self.ax.set_facecolor('#f8f9fa')
+        self.fig.patch.set_facecolor('white')
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    def setup_database(self):
+        import os
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        db_path = os.path.join(script_dir, "cooking_log.db")
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.cursor = self.conn.cursor()
+        self.cursor.execute('''CREATE TABLE IF NOT EXISTS logs (
+            id INTEGER PRIMARY KEY,
+            date TEXT,
+            duration INTEGER,
+            quality TEXT,
+            threshold REAL,
+            avg_temp REAL
+        )''')
+        self.conn.commit()
+
+    def setup_mqtt(self):
+        self.client = mqtt.Client()
+        self.client.username_pw_set(MQTT_USER, MQTT_PASS)
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        self.client.tls_set_context(context)
+        self.client.on_connect = self.on_connect
+        self.client.on_message = self.on_message
+        self.client.on_disconnect = self.on_disconnect
+        
+        self.connect_mqtt()
+
+    def connect_mqtt(self):
+        try:
+            self.connection_status.set("Connecting...")
+            self.connection_label.config(foreground="orange")
+            self.client.connect_async(MQTT_BROKER, MQTT_PORT, 60)
+            self.client.loop_start()
+            print("MQTT connection initiated...")
+        except Exception as e:
+            print(f"MQTT connection error: {e}")
+            self.connection_status.set("Connection Failed")
+            self.connection_label.config(foreground="red")
+            if self.reconnect_attempts < self.max_reconnect_attempts:
+                self.root.after(5000, self.connect_mqtt)  # Retry after 5 seconds
+                self.reconnect_attempts += 1
+            else:
+                self.start_simulation_mode()
+
+    def on_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            self.connection_status.set("Connected")
+            self.connection_label.config(foreground="green")
+            self.reconnect_attempts = 0
+            client.subscribe(MQTT_TOPIC_TEMP)
+            client.subscribe(MQTT_TOPIC_SENSOR_STATUS)
+            print("Connected to MQTT and subscribed to topics")
+        else:
+            self.connection_status.set("MQTT Error")
+            self.connection_label.config(foreground="red")
+            if self.reconnect_attempts < self.max_reconnect_attempts:
+                self.root.after(5000, self.connect_mqtt)
+                self.reconnect_attempts += 1
+            else:
+                self.start_simulation_mode()
+
+    def on_disconnect(self, client, userdata, rc):
+        self.connection_status.set("Disconnected")
+        self.connection_label.config(foreground="red")
+        self.sensor_status.set("Unknown")
+        self.arduino_status_label.config(foreground="gray")
+        print(f"MQTT disconnected with code: {rc}")
+
+    def on_message(self, client, userdata, msg):
+        try:
+            message = msg.payload.decode().strip()
+            if msg.topic == MQTT_TOPIC_TEMP:
+                temp = float(message)
+                self.message_queue.put(('temperature', temp))
+            elif msg.topic == MQTT_TOPIC_SENSOR_STATUS:
+                self.message_queue.put(('status', message))
+        except Exception as e:
+            print(f"Error processing message: {e}")
+
+    def start_simulation_mode(self):
+        self.connection_status.set("Simulation Mode")
+        self.connection_label.config(foreground="orange")
+        self.sensor_status.set("Simulated")
+        self.arduino_status_label.config(foreground="orange")
+        threading.Thread(target=self.simulate_temperature, daemon=True).start()
+
+    def simulate_temperature(self):
+        import random
+        base_temp = 25.0
+        while True:
+            if not self.sensor_enabled.get():
+                time.sleep(3)
+                continue
+                
+            # Simulate more realistic temperature changes
+            base_temp += random.uniform(-0.5, 1.5)
+            base_temp = max(15, min(85, base_temp))
+            
+            # Add some noise
+            noise = random.uniform(-0.2, 0.2)
+            simulated_temp = base_temp + noise
+            
+            self.message_queue.put(('temperature', simulated_temp))
+            time.sleep(2)
+
+    def toggle_sensor(self):
+        if self.sensor_enabled.get():
+            # Put sensor to sleep
+            self.sensor_enabled.set(False)
+            self.sensor_button.config(text="🟢 Wake Sensor Up")
+            self.sensor_status_indicator.config(text="SLEEPING", foreground="blue")
+            self.temp_label.config(foreground="gray")
+            
+            if hasattr(self, 'client') and self.connection_status.get() == "Connected":
+                self.client.publish(MQTT_TOPIC_SENSOR_CONTROL, "sleep")
+                print("Sent sleep command to Arduino")
+        else:
+            # Wake sensor up
+            self.sensor_enabled.set(True)
+            self.sensor_button.config(text="🔴 Put Sensor to Sleep")
+            self.sensor_status_indicator.config(text="ACTIVE", foreground="green")
+            self.temp_label.config(foreground="blue")
+            
+            if hasattr(self, 'client') and self.connection_status.get() == "Connected":
+                self.client.publish(MQTT_TOPIC_SENSOR_CONTROL, "wake")
+                print("Sent wake command to Arduino")
+
+    def manual_reconnect(self):
+        """Manual reconnection button"""
+        if hasattr(self, 'client'):
+            self.client.loop_stop()
+            self.client.disconnect()
+        self.reconnect_attempts = 0
+        self.setup_mqtt()
+
+    def update_sensor_status(self, status):
+        """Update Arduino status display with better formatting"""
+        status_configs = {
+            "active": ("Active", "green"),
+            "sleeping": ("Sleeping", "blue"),
+            "inactive": ("Inactive", "orange"),
+            "unknown": ("Unknown", "gray"),
+            "simulated": ("Simulated", "orange")
+        }
+        
+        text, color = status_configs.get(status.lower(), ("Unknown", "gray"))
+        self.sensor_status.set(text)
+        self.arduino_status_label.config(foreground=color)
+
+    def apply_threshold(self):
+        try:
+            value = float(self.threshold.get())
+            if 0 <= value <= 200:
+                self.active_threshold = value
+                # Update the threshold line position
+                self.threshold_line.set_ydata([value, value])
+                # Force canvas redraw immediately
+                self.canvas.draw_idle()
+                print(f"Threshold updated to {value}°C")
+                messagebox.showinfo("Success", f"Threshold set to {value}°C")
+            else:
+                messagebox.showerror("Invalid Range", "Threshold must be between 0-200°C")
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Please enter a valid number")
+
+    def update_temperature(self, temp):
+        self.live_temp.set(round(temp, 1))
+        self.last_temp_time = time.time()
+        
+        # Update temperature color based on threshold
+        if temp >= self.active_threshold:
+            self.temp_label.config(foreground="red")
+        else:
+            self.temp_label.config(foreground="blue")
+        
+        t = time.time() - self.start_time
+        self.timestamps.append(t)
+        self.temps.append(temp)
+        self.track_cooking_time(temp)
+
+    def track_cooking_time(self, temp):
+        now = time.time()
+        if temp >= self.active_threshold:
+            if not self.above_threshold:
+                self.cook_start_time = now
+                self.above_threshold = True
+        else:
+            if self.above_threshold:
+                self.total_cook_duration += now - self.cook_start_time
+                self.above_threshold = False
+
+        if self.above_threshold:
+            duration = self.total_cook_duration + (now - self.cook_start_time)
+        else:
+            duration = self.total_cook_duration
+
+        m, s = divmod(int(duration), 60)
+        h, m = divmod(m, 60)
+        
+        if h > 0:
+            self.cooking_time.set(f"{h}h {m}m {s}s")
+        elif m > 0:
+            self.cooking_time.set(f"{m}m {s}s")
+        else:
+            self.cooking_time.set(f"{s}s")
+
+    def record_feedback(self, quality):
+        try:
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            duration = int(self.total_cook_duration)
+            avg_temp = sum(self.temps) / len(self.temps) if self.temps else 0
+            
+            self.cursor.execute(
+                "INSERT INTO logs (date, duration, quality, threshold, avg_temp) VALUES (?, ?, ?, ?, ?)",
+                (now, duration, quality, self.active_threshold, round(avg_temp, 1))
+            )
+            self.conn.commit()
+            self.last_feedback.set(quality.capitalize())
+            
+            # Reset cooking session
+            self.total_cook_duration = 0
+            self.above_threshold = False
+            self.cook_start_time = None
+            
+            if hasattr(self, 'client') and self.connection_status.get() == "Connected":
+                self.client.publish(MQTT_TOPIC_FEEDBACK, quality)
+            
+            messagebox.showinfo("Feedback Recorded", f"Thank you! Feedback '{quality}' has been saved.")
+            print(f"Feedback recorded: {quality} (Duration: {duration}s, Avg Temp: {avg_temp:.1f}°C)")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to record feedback: {e}")
+
+    def monitor_sensor_activity(self):
+        """Monitor sensor connectivity and data flow"""
+        if self.sensor_enabled.get() and self.connection_status.get() == "Connected":
+            if hasattr(self, 'last_temp_time') and self.last_temp_time > 0:
+                time_since_last = time.time() - self.last_temp_time
+                if time_since_last > 20:  # No data for 20 seconds
+                    if self.sensor_status.get() not in ["Sleeping", "Unknown"]:
+                        self.update_sensor_status("inactive")
+        
+        self.root.after(10000, self.monitor_sensor_activity)  # Check every 10 seconds
+
+    def monitor_connection(self):
+        """Monitor MQTT connection health"""
+        if hasattr(self, 'client') and self.connection_status.get() == "Connected":
+            if not self.client.is_connected():
+                self.connection_status.set("Reconnecting...")
+                self.connection_label.config(foreground="orange")
+        
+        self.root.after(5000, self.monitor_connection)  # Check every 5 seconds
+
+    def update_graph(self):
+        if self.temps and self.timestamps:
+            # Calculate relative times (seconds ago)
+            current_time = self.timestamps[-1]
+            times = [current_time - t for t in self.timestamps]
+            times = [abs(t) for t in times]  # Convert to positive seconds ago
+            
+            # Update the temperature line
+            self.line.set_data(times, list(self.temps))
+            
+            # Update axis limits dynamically
+            max_time = max(times) if times else 60
+            self.ax.set_xlim(0, max(60, max_time + 5))
+            
+            # Update Y-axis based on temperature range
+            if self.temps:
+                temp_min = min(self.temps)
+                temp_max = max(self.temps)
+                temp_range = temp_max - temp_min
+                if temp_range < 10:  # If range is small, add more padding
+                    padding = 10
+                else:
+                    padding = temp_range * 0.2
+                
+                self.ax.set_ylim(temp_min - padding, temp_max + padding)
+            
+            # Ensure threshold line is visible and updated
+            self.threshold_line.set_ydata([self.active_threshold, self.active_threshold])
+            
+        # Force canvas update
+        self.canvas.draw_idle()
+        
+        # Schedule next update
+        self.root.after(1000, self.update_graph)  # Update every 1 second for smoother animation
+
+    def process_messages(self):
+        try:
+            while not self.message_queue.empty():
+                msg_type, value = self.message_queue.get_nowait()
+                if msg_type == "temperature":
+                    self.update_temperature(value)
+                elif msg_type == "status":
+                    self.update_sensor_status(value)
+        except Exception as e:
+            print(f"Error processing message queue: {e}")
+        finally:
+            self.root.after(500, self.process_messages)  # Process messages more frequently
+
+
+    
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = CookingMonitorApp(root)
+    root.mainloop()
